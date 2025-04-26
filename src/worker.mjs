@@ -4,7 +4,7 @@ export default {
   async fetch(request) {
     const { pathname } = new URL(request.url);
 
-    // 定义所有的“真实”API 路由
+    // 定义所有的"真实"API 路由
     const apiRoutes = [
       "/chat/completions",
       "/embeddings",
@@ -170,12 +170,41 @@ async function handleEmbeddings(req, apiKey) {
 }
 
 const DEFAULT_MODEL = "gemini-1.5-pro-latest";
+const THINKING_MODEL_ALIAS = "gemini-2.5-flash-thinking";
+const THINKING_MODEL_TARGET = "gemini-2.5-flash-preview-04-17";
+const MAX_THINKING_BUDGET = 24576; // 定义最大预算常量
+
 async function handleCompletions(req, apiKey) {
   let model = DEFAULT_MODEL;
+  let applyMaxThinkingBudgetByDefault = false; // 标志：是否应默认应用最大预算
+
   if (typeof req.model === "string") {
-    if (req.model.startsWith("models/")) model = req.model.slice(7);
-    else if (/^(gemini|learnlm)-/.test(req.model)) model = req.model;
+    if (req.model === THINKING_MODEL_ALIAS) {
+      model = THINKING_MODEL_TARGET;
+      // 如果客户端没有在请求中指定 thinking_budget，则设置标志
+      if (req.thinking_budget === undefined) {
+        applyMaxThinkingBudgetByDefault = true;
+      }
+      // 如果客户端指定了 thinking_budget，则让 transformConfig 处理它
+    } else if (req.model.startsWith("models/")) {
+      model = req.model.slice(7);
+    } else if (/^(gemini|learnlm)-/.test(req.model)) {
+      model = req.model;
+    }
   }
+
+  // --- 构造最终请求体 ---
+  const transformedMessages = await transformMessages(req.messages);
+  // 将标志传递给 transformConfig
+  const generationConfig = transformConfig(req, applyMaxThinkingBudgetByDefault);
+
+  const finalRequestBody = {
+      ...(transformedMessages || {}), // 处理 messages 可能为空的情况
+      safetySettings,
+      // 只有当 generationConfig 有内容时才包含它
+      ...(generationConfig && { generationConfig }),
+  };
+  // --- 请求体构造结束 ---
 
   const task = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${task}`;
@@ -184,9 +213,10 @@ async function handleCompletions(req, apiKey) {
   const resp = await fetch(url, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(await transformRequest(req)),
+    body: JSON.stringify(finalRequestBody), // 发送构造好的请求体
   });
 
+  // --- 响应处理 (保持不变) ---
   let body = resp.body;
   if (resp.ok) {
     const id = generateChatcmplId();
@@ -206,6 +236,7 @@ async function handleCompletions(req, apiKey) {
       body = processCompletionsResponse(data, model, id);
     }
   }
+  // --- 响应处理结束 ---
   return new Response(body, fixCors(resp));
 }
 
@@ -231,15 +262,39 @@ const fieldsMap = {
   frequency_penalty: "frequencyPenalty",
   presence_penalty: "presencePenalty",
 };
-const transformConfig = (req) => {
+const transformConfig = (req, applyMaxThinkingBudgetByDefault = false) => {
   let cfg = {};
-  //if (typeof req.stop === "string") { req.stop = [req.stop]; } // no need
+  // 映射标准字段
   for (let key in req) {
     const matchedKey = fieldsMap[key];
     if (matchedKey) {
       cfg[matchedKey] = req[key];
     }
   }
+
+  // --- 处理 thinking_budget 逻辑 ---
+  let thinkingBudgetApplied = false;
+  // 1. 检查用户是否明确提供了 thinking_budget
+  if (req.thinking_budget !== undefined) {
+    const budget = Number(req.thinking_budget);
+    if (!isNaN(budget) && budget >= 0 && budget <= MAX_THINKING_BUDGET) {
+      // 如果提供了有效预算，则使用它
+      cfg.thinkingConfig = { thinkingBudget: Math.floor(budget) };
+      thinkingBudgetApplied = true;
+    } else {
+      // 如果提供了无效预算，则忽略它，并且不应用默认的最大预算
+      console.warn(`收到了无效的 thinking_budget 值: ${req.thinking_budget}。已忽略。`);
+      thinkingBudgetApplied = true; // 标记为已处理 (即使是无效处理)
+    }
+  }
+
+  // 2. 如果用户没有提供预算，并且标志要求应用默认最大预算
+  if (!thinkingBudgetApplied && applyMaxThinkingBudgetByDefault) {
+     cfg.thinkingConfig = { thinkingBudget: MAX_THINKING_BUDGET };
+  }
+  // --- thinking_budget 逻辑结束 ---
+
+  // --- 处理 response_format (保持不变) ---
   if (req.response_format) {
     switch(req.response_format.type) {
       case "json_schema":
@@ -259,7 +314,11 @@ const transformConfig = (req) => {
         throw new HttpError("Unsupported response_format.type", 400);
     }
   }
-  return cfg;
+  // --- response_format 结束 ---
+
+  // 如果 cfg 对象没有任何属性，返回 undefined，否则返回 cfg
+  // 这可以避免向 Google API 发送空的 generationConfig: {}
+  return Object.keys(cfg).length > 0 ? cfg : undefined;
 };
 
 const parseImg = async (url) => {
@@ -351,7 +410,7 @@ const transformMessages = async (messages) => {
 const transformRequest = async (req) => ({
   ...await transformMessages(req.messages),
   safetySettings,
-  generationConfig: transformConfig(req),
+  // generationConfig: transformConfig(req), // 在 handleCompletions 中添加
 });
 
 const generateChatcmplId = () => {
